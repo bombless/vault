@@ -1,0 +1,10 @@
+{
+  "name": "local-vault-cli",
+  "version": "0.1.0",
+  "description": "A small profile-based local JSON secret store with OS permission boundaries",
+  "private": true,
+  "type": "commonjs",
+  "bin": { "vault": "bin/vault.js" },
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=18" }
+}
