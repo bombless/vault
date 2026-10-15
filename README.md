@@ -17,12 +17,18 @@ After creating a profile, switch to it with its password before reading or writi
 
 ## Storage and security boundary
 
-- JSON files contain plaintext values. On POSIX, directories are chmod 0700 and files 0600; symlink profile files and files owned by another user are rejected.
-- Default data path is `~/.local/share/vault-cli` (or `%LOCALAPPDATA%\\vault-cli` on Windows); override with `VAULT_HOME`.
-- The profile password is a CLI switching guard, **not encryption**. A user who can read the JSON file can bypass the CLI or modify its source. Do not rely on the password to defend secrets from arbitrary code running as the same OS user.
-- To protect `dev`/`prod` from a coding agent, run the agent as a separate unprivileged OS account and keep those profile files owned by a different account with restrictive permissions. Do not give the agent sudo, root, Docker socket access, or production deployment credentials.
-- On Windows, only `vault profile <name>` (switching to a profile) triggers UAC elevation when not already running as Administrator. All other commands (`vault profile`, `vault profile list`, `vault profile init`, `read`, `write`, and help) run without UAC. Under this session-isolation model, inactive profile JSON files are protected by NTFS ACLs accessible only to local Administrators and SYSTEM. When switching to a profile via `vault profile <name>`, UAC authorization verifies the password, locks all inactive profiles to Administrators-only, and unlocks the selected active profile for the current user. Everyday `read` and `write` operations then proceed under standard unprivileged user permissions against the active profile without UAC prompts.
-- Windows security depends on NTFS ACLs and UAC, not Node's chmod-style mode bits. An administrator or SYSTEM can still read the plaintext JSON; this is access control, not encryption. Do not store secrets on a machine where untrusted administrators or administrator-level malware are in scope.
+- **AES-256-GCM Encrypted Storage**: All profile JSON configuration values are encrypted at rest using AES-256-GCM authenticated encryption. Encryption keys are securely derived from the profile's password and a random salt using `scrypt`.
+- **Session-based Key Isolation (Cross-Platform)**:
+  - When switching profiles with `vault profile <name>`, the user verifies the profile password.
+  - A 32-byte derived session key is generated and cached in a private session store (`/dev/shm` RAM tmpfs on Linux where available, or `%LOCALAPPDATA%\\vault-cli` on Windows) with `0600` permissions.
+  - **The user's plaintext password is never stored**.
+  - Subsequent `read` and `write` operations transparently decrypt and re-encrypt the active profile without re-prompting for passwords.
+- **Protection for Inactive Profiles**:
+  - Inactive profile files on disk are completely encrypted. Even if an unprivileged agent, untrusted script, or other processes running under the same OS user attempt to read `prod.json`, they will only observe ciphertext (`data`, `iv`, `tag`, and `salt`). Without the specific profile password or key, values cannot be decrypted.
+  - On POSIX, directories are enforced with `chmod 0700` and files with `chmod 0600`; symlink profile files and files owned by another user are rejected.
+- **Zero-OS-Privilege Overhead**:
+  - Both Linux and Windows share the exact same user experience without requiring administrative privileges, UAC prompts, `sudo`, or `pkexec`.
+  - Default data path is `~/.local/share/vault-cli` (or `%LOCALAPPDATA%\\vault-cli` on Windows); override with `VAULT_HOME`.
 
 ## Install the command
 
