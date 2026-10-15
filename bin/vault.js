@@ -6,6 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const readline = require('node:readline');
+const { spawnSync } = require('node:child_process');
 
 const DEFAULT_HOME = process.platform === 'win32'
   ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'vault-cli')
@@ -49,10 +50,127 @@ function assertPrivateFile(file) {
     if ((st.mode & 0o077) !== 0) throw new Error('配置文件权限过宽；请设置为 chmod 600');
   }
 }
+function getWindowsUser() {
+  const domain = process.env.USERDOMAIN;
+  const username = process.env.USERNAME;
+  if (domain && username) return `${domain}\\${username}`;
+  return username || os.userInfo().username;
+}
+function isWindowsAdministrator() {
+  if (process.platform !== 'win32') return true;
+  const script = "$p = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()); if ($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }";
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8' });
+  return result.status === 0;
+}
+function quoteWindowsArg(value) {
+  const s = String(value);
+  if (s.length && !(/[\s"]/.test(s))) return s;
+  return JSON.stringify(s);
+}
+function elevateWindows(argv, targetUser = getWindowsUser()) {
+  const nodeExe = process.execPath;
+  const scriptPath = path.resolve(process.argv[1]);
+  const forwardArgs = [
+    scriptPath,
+    ...argv,
+    '--grant-user', targetUser,
+    '--vault-home', DATA_HOME,
+    '--elevated-child'
+  ];
+  const psQuote = v => `'${String(v).replace(/'/g, "''")}'`;
+  const argListStr = forwardArgs.map(quoteWindowsArg).join(' ');
+  const psCommand = `$p = Start-Process -FilePath ${psQuote(nodeExe)} -ArgumentList ${psQuote(argListStr)} -Verb RunAs -Wait -PassThru; exit $p.ExitCode`;
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psCommand], { stdio: 'inherit' });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error('需要管理员权限；UAC 提权未能启动、已取消或切换失败');
+  }
+}
+function requireWindowsAdministrator(argv) {
+  if (process.platform !== 'win32') return false;
+  if (argv.includes('--elevated-child')) return false;
+  const [command, ...args] = argv;
+  // Only `vault profile <name>` switches profiles and prompts for UAC.
+  // Status/list/init and all read/write/help commands must not trigger UAC.
+  const needsAdmin = command === 'profile' && args.length === 1 && validName(args[0]) && !['list', '--list', 'init', '--status'].includes(args[0]);
+  if (!needsAdmin || isWindowsAdministrator()) return false;
+  elevateWindows(argv);
+  return true;
+}
+function secureWindowsUserFileAcl(file, user = getWindowsUser()) {
+  if (process.platform !== 'win32') return;
+  const grants = ['*S-1-5-32-544:F', '*S-1-5-18:F'];
+  if (user) grants.push(`${user}:F`);
+  spawnSync('icacls.exe', [file, '/inheritance:r', '/grant:r', ...grants], { encoding: 'utf8', windowsHide: true });
+}
+function lockWindowsProfileFile(file, user = getWindowsUser()) {
+  if (process.platform !== 'win32') return;
+  if (user) {
+    spawnSync('icacls.exe', [file, '/remove:g', user, '*S-1-5-32-545'], { encoding: 'utf8', windowsHide: true });
+  }
+  spawnSync('icacls.exe', [file, '/inheritance:r', '/grant:r', '*S-1-5-32-544:F', '*S-1-5-18:F'], { encoding: 'utf8', windowsHide: true });
+}
+function syncWindowsProfileAcls(activeName, targetUser = getWindowsUser(), profilesDir = PROFILES_DIR) {
+  if (process.platform !== 'win32') return;
+  if (!targetUser) return;
+  ensurePrivateDir(profilesDir);
+  // Ensure profile directory allows Administrators, SYSTEM, and the target user to list & create files
+  spawnSync('icacls.exe', [
+    profilesDir,
+    '/inheritance:r',
+    '/grant:r',
+    '*S-1-5-32-544:(OI)(CI)F',
+    '*S-1-5-18:(OI)(CI)F',
+    `${targetUser}:(OI)(CI)F`
+  ], { encoding: 'utf8', windowsHide: true });
+
+  if (!fs.existsSync(profilesDir)) return;
+  for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith('.json')) {
+      const pName = entry.name.slice(0, -5);
+      const filePath = path.join(profilesDir, entry.name);
+      if (pName === activeName) {
+        // Active profile: unlocked for target user
+        spawnSync('icacls.exe', [
+          filePath,
+          '/inheritance:r',
+          '/grant:r',
+          '*S-1-5-32-544:F',
+          '*S-1-5-18:F',
+          `${targetUser}:F`
+        ], { encoding: 'utf8', windowsHide: true });
+      } else {
+        // Inactive profiles: locked to Admin & SYSTEM only (explicitly remove user and common groups)
+        spawnSync('icacls.exe', [
+          filePath,
+          '/remove:g',
+          targetUser,
+          '*S-1-5-32-545'
+        ], { encoding: 'utf8', windowsHide: true });
+        spawnSync('icacls.exe', [
+          filePath,
+          '/inheritance:r',
+          '/grant:r',
+          '*S-1-5-32-544:F',
+          '*S-1-5-18:F'
+        ], { encoding: 'utf8', windowsHide: true });
+        spawnSync('icacls.exe', [filePath, '/setowner', '*S-1-5-32-544'], { encoding: 'utf8', windowsHide: true });
+      }
+    }
+  }
+}
 function readProfile(name, profilesDir = PROFILES_DIR) {
   const file = profilePath(name, profilesDir);
   assertPrivateFile(file);
-  const raw = fs.readFileSync(file, 'utf8');
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e.code === 'EPERM' || e.code === 'EACCES') {
+      throw new Error(`无权访问 profile "${name}"；该 profile 未激活或需要管理员权限授权，请运行 vault profile ${name}`);
+    }
+    throw e;
+  }
   const data = JSON.parse(raw);
   if (data.version !== 1 || !data.values || typeof data.values !== 'object' || !data.auth) {
     throw new Error(`profile 文件格式无效：${name}`);
@@ -69,6 +187,7 @@ function writePrivateText(file, text) {
     if (process.platform !== 'win32') fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, file);
     if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
+    else secureWindowsUserFileAcl(file);
   } finally { if (fd !== undefined) fs.closeSync(fd); try { fs.unlinkSync(tmp); } catch {} }
 }
 function writeJsonPrivate(file, data) {
@@ -83,6 +202,7 @@ function writeJsonPrivate(file, data) {
     if (process.platform !== 'win32') fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, file);
     if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
+    else secureWindowsUserFileAcl(file);
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     try { fs.unlinkSync(tmp); } catch {}
@@ -140,7 +260,13 @@ function activeProfile() {
 function listProfiles() {
   try {
     return fs.readdirSync(PROFILES_DIR).filter(f => f.endsWith('.json')).map(f => f.slice(0, -5)).filter(validName).sort();
-  } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    if (process.platform === 'win32' && (e.code === 'EPERM' || e.code === 'EACCES')) {
+      throw new Error(`无法读取 profiles 目录（目录权限被旧版本锁死）：${PROFILES_DIR}\n请在 PowerShell 中执行以下命令恢复权限：\n  Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -Command icacls \"$env:LOCALAPPDATA\\vault-cli\" /reset /t'`);
+    }
+    throw e;
+  }
 }
 async function readStdinValue() {
   const chunks = [];
@@ -150,9 +276,29 @@ async function readStdinValue() {
 }
 
 async function main(argv) {
-  const [command, ...args] = argv;
+  let grantUser = getWindowsUser();
+  let isElevatedChild = false;
+  const cleanArgs = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--elevated-child') {
+      isElevatedChild = true;
+    } else if (argv[i] === '--grant-user' && i + 1 < argv.length) {
+      grantUser = argv[++i];
+    } else if (argv[i] === '--vault-home' && i + 1 < argv.length) {
+      // already resolved or can override
+      i++;
+    } else {
+      cleanArgs.push(argv[i]);
+    }
+  }
+
+  const [command, ...args] = cleanArgs;
   try {
     if (!command || ['help', '--help', '-h'].includes(command)) return usage();
+    if (requireWindowsAdministrator(cleanArgs)) {
+      console.log(`当前 profile：${cleanArgs[1]}`);
+      return;
+    }
     if (command === 'profile') {
       if (args.length === 0 || args[0] === '--status') {
         console.log(activeProfile() || '(未选择 profile)');
@@ -174,6 +320,9 @@ async function main(argv) {
         const p2 = await prompt('再次输入密码：', { hidden: true });
         if (p1 !== p2) throw new Error('两次密码不一致');
         writeJsonPrivate(file, { version: 1, auth: hashPassword(p1), values: {} });
+        if (process.platform === 'win32') {
+          lockWindowsProfileFile(file);
+        }
         console.log(`已创建 profile：${name}`);
         return;
       }
@@ -181,7 +330,16 @@ async function main(argv) {
       const name = args[0];
       const data = readProfile(name); // OS permissions are checked before asking for a password.
       const password = await prompt(`切换到 ${name}，请输入密码：`, { hidden: true });
-      if (!verifyPassword(password, data.auth)) throw new Error('密码错误');
+      if (!verifyPassword(password, data.auth)) {
+        if (isElevatedChild) {
+          console.error('vault: 密码错误');
+          await new Promise(r => setTimeout(r, 1500));
+        }
+        throw new Error('密码错误');
+      }
+      if (process.platform === 'win32') {
+        syncWindowsProfileAcls(name, grantUser, PROFILES_DIR);
+      }
       // Current profile is a non-secret per-user state file.
       writePrivateText(ACTIVE_FILE, `${name}\n`);
       console.log(`当前 profile：${name}`);
@@ -219,4 +377,4 @@ function usage() {
 }
 
 if (require.main === module) main(process.argv.slice(2)).finally(() => { if (lineInterface) lineInterface.close(); });
-module.exports = { validName, validKey, hashPassword, verifyPassword, profilePath, readProfile, writeJsonPrivate, writePrivateText };
+module.exports = { validName, validKey, hashPassword, verifyPassword, profilePath, readProfile, writeJsonPrivate, writePrivateText, isWindowsAdministrator, syncWindowsProfileAcls };
